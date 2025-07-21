@@ -99,6 +99,7 @@ struct LlmInferenceEngineCpu_Engine {
 struct LlmInferenceEngineCpu_Session {
   const LlmInferenceEngineCpu_Engine* engine;
   std::string prompt;
+  const char* audio_prompt;
   int timestep;
   std::string last_10_char;
   std::string final_output;
@@ -273,6 +274,15 @@ void* start_llm_function(void* args) {
   std::vector<int> prompt_ids = {};
 
   std::string prompt;
+
+  if (cpu_session->audio_prompt != nullptr) {
+    auto status = cpu_session->engine->tokenizer->Encode(
+        cpu_session->audio_prompt, &prompt_ids);
+    if (!status.ok()) {
+      ABSL_LOG(FATAL) << "Failed to encode input: " << status;
+    }
+  }
+
   if (cpu_session->engine->bytes_to_unicode_mapper != nullptr) {
     prompt = MapBytesToUnicode(cpu_session->prompt,
                                cpu_session->engine->bytes_to_unicode_mapper);
@@ -520,7 +530,7 @@ LlmInferenceEngine_CreateSession_Helper(
     const LlmInferenceEngineCpu_Engine* engine,
     const LlmSessionConfig* session_config) {
   std::unique_ptr<LlmInferenceEngineCpu_Session> session(
-      new LlmInferenceEngineCpu_Session{.engine = engine});
+      new LlmInferenceEngineCpu_Session{.engine = engine, .audio_prompt = nullptr});
 
   return session.release();
 }
@@ -598,8 +608,9 @@ ODML_EXPORT int LlmInferenceEngine_Session_AddImage(
 ODML_EXPORT int LlmInferenceEngine_Session_AddAudio(
     LlmInferenceEngine_Engine* engine, LlmInferenceEngine_Session* session,
     const char* audio_bytes, int audio_bytes_size, char** error_msg) {
-  *error_msg = strdup("Not implemented");
-  return 12;
+  auto cpu_session = reinterpret_cast<LlmInferenceEngineCpu_Session*>(session);
+  cpu_session->audio_prompt = audio_bytes;
+  return 0;
 }
 
 int LlmInferenceEngine_Session_PredictSync(LlmInferenceEngine_Session* session,

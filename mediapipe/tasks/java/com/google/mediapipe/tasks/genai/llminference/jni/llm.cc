@@ -333,6 +333,13 @@ JNIEXPORT void JNICALL JNI_METHOD(nativeAddQueryChunk)(JNIEnv* env, jclass thiz,
                                                        jstring input) {
   std::string input_str = JStringToStdString(env, input);
   char* error_msg = nullptr;
+  auto* session = reinterpret_cast<LlmInferenceEngine_Session*>(session_handle);
+  std::string current_prompt;
+  if (session->prompt != nullptr) {
+    current_prompt = session->prompt;
+  }
+  current_prompt += input_str;
+  session->prompt = current_prompt.c_str();
   int error_code = LlmInferenceEngine_Session_AddQueryChunk(
       reinterpret_cast<void*>(session_handle), input_str.c_str(), &error_msg);
   if (error_code) {
@@ -406,18 +413,20 @@ JNI_METHOD(nativePredictSync)(JNIEnv* env, jclass thiz, jlong session_handle) {
 JNIEXPORT jobject JNICALL JNI_METHOD(nativeRegisterCallback)(JNIEnv* env,
                                                              jclass thiz,
                                                              jobject callback) {
-  if (mediapipe::java::SetJavaVM(env)) {
-    auto callback_ref = env->NewGlobalRef(callback);
-    if (callback_ref) return callback_ref;
+  jobject callback_ref = env->NewGlobalRef(callback);
+  if (callback_ref == nullptr) {
+    ThrowIfError(env, absl::InternalError("Failed to allocate callback"));
+    return nullptr;
   }
-  ThrowIfError(env, absl::InternalError("Failed to allocate callback"));
-  return nullptr;
+  return callback_ref;
 }
 
 JNIEXPORT void JNICALL JNI_METHOD(nativeRemoveCallback)(JNIEnv* env,
                                                         jclass thiz,
                                                         jobject callback_ref) {
-  env->DeleteGlobalRef(callback_ref);
+  if (callback_ref != nullptr) {
+    env->DeleteGlobalRef(callback_ref);
+  }
 }
 
 JNIEXPORT void JNICALL JNI_METHOD(nativePredictAsync)(JNIEnv* env, jclass thiz,
