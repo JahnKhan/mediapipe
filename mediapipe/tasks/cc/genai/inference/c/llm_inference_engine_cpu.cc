@@ -99,7 +99,7 @@ struct LlmInferenceEngineCpu_Engine {
 struct LlmInferenceEngineCpu_Session {
   const LlmInferenceEngineCpu_Engine* engine;
   std::string prompt;
-  const char* audio_prompt;
+  std::string audio_data;
   int timestep;
   std::string last_10_char;
   std::string final_output;
@@ -275,12 +275,10 @@ void* start_llm_function(void* args) {
 
   std::string prompt;
 
-  if (cpu_session->audio_prompt != nullptr) {
-    auto status = cpu_session->engine->tokenizer->Encode(
-        cpu_session->audio_prompt, &prompt_ids);
-    if (!status.ok()) {
-      ABSL_LOG(FATAL) << "Failed to encode input: " << status;
-    }
+  if (!cpu_session->audio_data.empty()) {
+    // For now, audio data is stored but not processed in this basic implementation
+    // Future enhancement: Convert audio to appropriate tokens/embeddings
+    ABSL_LOG(INFO) << "Audio data received, size: " << cpu_session->audio_data.size() << " bytes";
   }
 
   if (cpu_session->engine->bytes_to_unicode_mapper != nullptr) {
@@ -530,7 +528,7 @@ LlmInferenceEngine_CreateSession_Helper(
     const LlmInferenceEngineCpu_Engine* engine,
     const LlmSessionConfig* session_config) {
   std::unique_ptr<LlmInferenceEngineCpu_Session> session(
-      new LlmInferenceEngineCpu_Session{.engine = engine, .audio_prompt = nullptr});
+      new LlmInferenceEngineCpu_Session{.engine = engine, .audio_data = ""});
 
   return session.release();
 }
@@ -609,7 +607,7 @@ ODML_EXPORT int LlmInferenceEngine_Session_AddAudio(
     LlmInferenceEngine_Engine* engine, LlmInferenceEngine_Session* session,
     const char* audio_bytes, int audio_bytes_size, char** error_msg) {
   auto cpu_session = reinterpret_cast<LlmInferenceEngineCpu_Session*>(session);
-  cpu_session->audio_prompt = audio_bytes;
+  cpu_session->audio_data = std::string(audio_bytes, audio_bytes_size);
   return 0;
 }
 

@@ -333,13 +333,6 @@ JNIEXPORT void JNICALL JNI_METHOD(nativeAddQueryChunk)(JNIEnv* env, jclass thiz,
                                                        jstring input) {
   std::string input_str = JStringToStdString(env, input);
   char* error_msg = nullptr;
-  auto* session = reinterpret_cast<LlmInferenceEngine_Session*>(session_handle);
-  std::string current_prompt;
-  if (session->prompt != nullptr) {
-    current_prompt = session->prompt;
-  }
-  current_prompt += input_str;
-  session->prompt = current_prompt.c_str();
   int error_code = LlmInferenceEngine_Session_AddQueryChunk(
       reinterpret_cast<void*>(session_handle), input_str.c_str(), &error_msg);
   if (error_code) {
