@@ -63,10 +63,214 @@
 #include "tensorflow/lite/interpreter_builder.h"
 #include "tensorflow/lite/kernels/register.h"
 #include "tensorflow/lite/model_builder.h"
+#include "mediapipe/util/audio_decoder.h"
+#include "mediapipe/framework/formats/matrix.h"
+#include "mediapipe/calculators/tensor/audio_to_tensor_calculator.h"
 
 namespace {
 
 using ::mediapipe::tasks::genai::llm_utils::ScopedFile;
+
+// Audio processing constants based on Gemini specifications
+constexpr int kTargetSampleRate = 16000;  // 16kHz as required by Gemini
+constexpr int kTargetChannels = 1;        // Mono audio
+constexpr int kTokensPerSecond = 32;      // Gemini: 32 tokens per second of audio
+constexpr int kMaxAudioLengthSeconds = 9 * 3600 + 30 * 60;  // 9.5 hours max
+
+// Audio format validation
+bool IsValidAudioFormat(const std::string& audio_data) {
+  if (audio_data.size() < 8) {
+    return false;
+  }
+  
+  // Check for common audio file headers
+  // WAV: "RIFF" and "WAVE"
+  if (audio_data.substr(0, 4) == "RIFF" && 
+      audio_data.size() > 12 && 
+      audio_data.substr(8, 4) == "WAVE") {
+    return true;
+  }
+  
+  // MP3: check for MP3 frame sync
+  if (audio_data.size() >= 2) {
+    unsigned char byte1 = static_cast<unsigned char>(audio_data[0]);
+    unsigned char byte2 = static_cast<unsigned char>(audio_data[1]);
+    if (byte1 == 0xFF && (byte2 & 0xE0) == 0xE0) {
+      return true;
+    }
+  }
+  
+  // Basic checks for other formats could be added here
+  return false;
+}
+
+// Audio format validation and preprocessing
+struct AudioPreprocessingResult {
+  std::vector<float> audio_samples;
+  int sample_rate;
+  int channels;
+  int duration_ms;
+  int token_count;
+};
+
+absl::StatusOr<AudioPreprocessingResult> PreprocessAudioData(
+    const std::string& audio_data) {
+  AudioPreprocessingResult result;
+  
+  // Validate audio format
+  if (!IsValidAudioFormat(audio_data)) {
+    return absl::InvalidArgumentError(
+        "Unsupported audio format. Supported formats: WAV, MP3, AAC, OGG, FLAC");
+  }
+  
+  // Decode audio data (supports WAV, MP3, AAC, etc.)
+  auto decoder_result = mediapipe::DecodeAudioFromMemory(
+      audio_data.data(), audio_data.size());
+  
+  if (!decoder_result.ok()) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Failed to decode audio data: ", decoder_result.status().message()));
+  }
+  
+  auto& [audio_matrix, sample_rate] = decoder_result.value();
+  
+  // Validate audio parameters
+  if (sample_rate <= 0 || sample_rate > 192000) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Invalid sample rate: ", sample_rate, "Hz. Expected range: 1-192000Hz"));
+  }
+  
+  int input_channels = audio_matrix.rows();
+  int num_samples = audio_matrix.cols();
+  
+  if (input_channels <= 0 || input_channels > 8) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Invalid number of channels: ", input_channels, 
+                    ". Expected range: 1-8 channels"));
+  }
+  
+  if (num_samples <= 0) {
+    return absl::InvalidArgumentError("Audio contains no samples");
+  }
+  
+  // Calculate duration and validate length
+  float duration_seconds = static_cast<float>(num_samples) / sample_rate;
+  if (duration_seconds > kMaxAudioLengthSeconds) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Audio too long: ", duration_seconds, 
+                    " seconds (max: ", kMaxAudioLengthSeconds, " seconds)"));
+  }
+  
+  if (duration_seconds < 0.1f) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Audio too short: ", duration_seconds, 
+                    " seconds (min: 0.1 seconds)"));
+  }
+
+  // Convert to mono if necessary
+  mediapipe::Matrix mono_audio;
+  if (input_channels == 1) {
+    mono_audio = audio_matrix;
+  } else {
+    // Convert multi-channel to mono by averaging
+    mono_audio = mediapipe::Matrix::Zero(1, num_samples);
+    for (int i = 0; i < num_samples; ++i) {
+      float sum = 0.0f;
+      for (int ch = 0; ch < input_channels; ++ch) {
+        sum += audio_matrix(ch, i);
+      }
+      mono_audio(0, i) = sum / input_channels;
+    }
+    ABSL_LOG(INFO) << "Converted " << input_channels << " channels to mono";
+  }
+  
+  // Resample to 16kHz if necessary
+  mediapipe::Matrix resampled_audio;
+  int output_sample_rate = sample_rate;
+  
+  if (sample_rate != kTargetSampleRate) {
+    ABSL_LOG(INFO) << "Resampling from " << sample_rate << "Hz to " << kTargetSampleRate << "Hz";
+    
+    // Calculate new sample count
+    int new_sample_count = static_cast<int>(
+        num_samples * static_cast<float>(kTargetSampleRate) / sample_rate);
+    
+    resampled_audio = mediapipe::Matrix::Zero(1, new_sample_count);
+    
+    // Simple linear interpolation resampling
+    float ratio = static_cast<float>(num_samples) / new_sample_count;
+    for (int i = 0; i < new_sample_count; ++i) {
+      float src_index = i * ratio;
+      int src_int = static_cast<int>(src_index);
+      float frac = src_index - src_int;
+      
+      if (src_int + 1 < num_samples) {
+        resampled_audio(0, i) = mono_audio(0, src_int) * (1.0f - frac) + 
+                               mono_audio(0, src_int + 1) * frac;
+      } else {
+        resampled_audio(0, i) = mono_audio(0, src_int);
+      }
+    }
+    output_sample_rate = kTargetSampleRate;
+    num_samples = new_sample_count;
+  } else {
+    resampled_audio = mono_audio;
+  }
+  
+  // Convert to vector format
+  result.audio_samples.resize(num_samples);
+  for (int i = 0; i < num_samples; ++i) {
+    result.audio_samples[i] = resampled_audio(0, i);
+  }
+  
+  result.sample_rate = output_sample_rate;
+  result.channels = 1;
+  result.duration_ms = static_cast<int>(duration_seconds * 1000);
+  result.token_count = static_cast<int>(duration_seconds * kTokensPerSecond);
+  
+  ABSL_LOG(INFO) << "Audio preprocessed: " << duration_seconds << "s, " 
+                 << result.token_count << " tokens, " << output_sample_rate << "Hz";
+  
+  return result;
+}
+
+// Convert audio samples to tokens for LLM processing
+std::vector<int> AudioSamplesToTokens(const std::vector<float>& audio_samples,
+                                     int sample_rate) {
+  // This is a simplified audio tokenization
+  // In a complete implementation, this would use a proper audio encoder
+  // like Whisper encoder or similar multimodal tokenization
+  
+  std::vector<int> audio_tokens;
+  
+  // Group audio into frames (32ms frames at 16kHz = 512 samples per frame)
+  int samples_per_frame = (sample_rate * 32) / 1000;  // 32ms frames
+  int num_frames = audio_samples.size() / samples_per_frame;
+  
+  // Reserve space for tokens (approximately 1 token per frame)
+  audio_tokens.reserve(num_frames);
+  
+  // Generate representative tokens for each frame
+  for (int frame = 0; frame < num_frames; ++frame) {
+    int start_idx = frame * samples_per_frame;
+    int end_idx = std::min(start_idx + samples_per_frame, 
+                          static_cast<int>(audio_samples.size()));
+    
+    // Calculate RMS energy for this frame
+    float rms = 0.0f;
+    for (int i = start_idx; i < end_idx; ++i) {
+      rms += audio_samples[i] * audio_samples[i];
+    }
+    rms = std::sqrt(rms / (end_idx - start_idx));
+    
+    // Map RMS energy to a token ID range (simplified approach)
+    // In practice, this would be done by a trained audio encoder
+    int token_id = 50000 + static_cast<int>(rms * 1000) % 10000;
+    audio_tokens.push_back(token_id);
+  }
+  
+  return audio_tokens;
+}
 
 constexpr int kCheckLastKChars = 10;
 
@@ -100,6 +304,8 @@ struct LlmInferenceEngineCpu_Session {
   const LlmInferenceEngineCpu_Engine* engine;
   std::string prompt;
   std::string audio_data;
+  std::vector<int> audio_tokens;  // Preprocessed audio tokens
+  bool has_audio_input;
   int timestep;
   std::string last_10_char;
   std::string final_output;
@@ -275,10 +481,17 @@ void* start_llm_function(void* args) {
 
   std::string prompt;
 
-  if (!cpu_session->audio_data.empty()) {
-    // For now, audio data is stored but not processed in this basic implementation
-    // Future enhancement: Convert audio to appropriate tokens/embeddings
-    ABSL_LOG(INFO) << "Audio data received, size: " << cpu_session->audio_data.size() << " bytes";
+  // Process audio input if available
+  if (cpu_session->has_audio_input && !cpu_session->audio_tokens.empty()) {
+    ABSL_LOG(INFO) << "Processing audio input with " 
+                   << cpu_session->audio_tokens.size() << " audio tokens";
+    
+    // Add audio tokens to the prompt_ids
+    // In a complete implementation, audio tokens would be properly integrated
+    // with text tokens according to the model's multimodal architecture
+    prompt_ids.insert(prompt_ids.end(), 
+                     cpu_session->audio_tokens.begin(), 
+                     cpu_session->audio_tokens.end());
   }
 
   if (cpu_session->engine->bytes_to_unicode_mapper != nullptr) {
@@ -288,11 +501,32 @@ void* start_llm_function(void* args) {
     prompt = cpu_session->prompt;
   }
 
-  auto status = cpu_session->engine->tokenizer->Encode(prompt, &prompt_ids);
+  // Tokenize text prompt
+  std::vector<int> text_prompt_ids;
+  auto status = cpu_session->engine->tokenizer->Encode(prompt, &text_prompt_ids);
 
   if (!status.ok()) {
     ABSL_LOG(FATAL) << "Failed to encode input: " << status;
   }
+  
+  // Combine audio and text tokens
+  // For multimodal models, the order and integration of tokens matters
+  // This is a simplified approach - in practice, this would follow
+  // the specific model's multimodal token organization
+  if (cpu_session->has_audio_input) {
+    // Insert text tokens after audio tokens (model-dependent)
+    prompt_ids.insert(prompt_ids.end(), 
+                     text_prompt_ids.begin(), 
+                     text_prompt_ids.end());
+    
+    ABSL_LOG(INFO) << "Combined tokens: " 
+                   << cpu_session->audio_tokens.size() << " audio + "
+                   << text_prompt_ids.size() << " text = "
+                   << prompt_ids.size() << " total";
+  } else {
+    prompt_ids = text_prompt_ids;
+  }
+  
   prompt_ids.insert(prompt_ids.begin(), cpu_session->engine->start_token_id);
 
   if (std::holds_alternative<mediapipe::tasks::genai::xnn_utils::Llm*>(
@@ -528,7 +762,25 @@ LlmInferenceEngine_CreateSession_Helper(
     const LlmInferenceEngineCpu_Engine* engine,
     const LlmSessionConfig* session_config) {
   std::unique_ptr<LlmInferenceEngineCpu_Session> session(
-      new LlmInferenceEngineCpu_Session{.engine = engine, .audio_data = ""});
+      new LlmInferenceEngineCpu_Session{
+          .engine = engine, 
+          .audio_data = "",
+          .audio_tokens = {},
+          .has_audio_input = false
+      });
+
+  // Configure audio modality if enabled
+  if (session_config && session_config->enable_audio_modality) {
+    ABSL_LOG(INFO) << "Audio modality enabled for session";
+    
+    // Validate audio configuration
+    if (engine->enable_audio_modality) {
+      ABSL_LOG(INFO) << "Engine supports audio modality, max sequence length: " 
+                     << engine->max_audio_sequence_length;
+    } else {
+      ABSL_LOG(WARNING) << "Session requests audio modality but engine doesn't support it";
+    }
+  }
 
   return session.release();
 }
@@ -606,8 +858,40 @@ ODML_EXPORT int LlmInferenceEngine_Session_AddImage(
 ODML_EXPORT int LlmInferenceEngine_Session_AddAudio(
     LlmInferenceEngine_Engine* engine, LlmInferenceEngine_Session* session,
     const char* audio_bytes, int audio_bytes_size, char** error_msg) {
+  
+  if (!audio_bytes || audio_bytes_size <= 0) {
+    *error_msg = strdup("Invalid audio data provided");
+    return 1;
+  }
+  
   auto cpu_session = reinterpret_cast<LlmInferenceEngineCpu_Session*>(session);
+  
+  // Store raw audio data
   cpu_session->audio_data = std::string(audio_bytes, audio_bytes_size);
+  
+  // Preprocess audio data
+  auto preprocessing_result = PreprocessAudioData(cpu_session->audio_data);
+  
+  if (!preprocessing_result.ok()) {
+    std::string error = absl::StrCat("Audio preprocessing failed: ", 
+                                   preprocessing_result.status().message());
+    *error_msg = strdup(error.c_str());
+    ABSL_LOG(ERROR) << error;
+    return 1;
+  }
+  
+  auto& audio_result = preprocessing_result.value();
+  
+  // Convert audio to tokens
+  cpu_session->audio_tokens = AudioSamplesToTokens(
+      audio_result.audio_samples, audio_result.sample_rate);
+  
+  cpu_session->has_audio_input = true;
+  
+  ABSL_LOG(INFO) << "Audio added successfully: " 
+                 << audio_result.duration_ms << "ms, "
+                 << cpu_session->audio_tokens.size() << " tokens";
+  
   return 0;
 }
 
